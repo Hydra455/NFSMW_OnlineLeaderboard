@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "C:\\Users\\k3nto\\Documents\\MWLeaderboard\\obj\\ServerConfig.obj",
+            "outputs": [
+                "C:\\Users\\k3nto\\Documents\\MWLeaderboard\\obj\\ServerConfig.h.obj.dt.module.json",
+                "C:\\Users\\k3nto\\Documents\\MWLeaderboard\\obj\\ServerConfig.h.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}
