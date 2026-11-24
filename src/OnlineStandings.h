@@ -16,3 +16,7 @@ std::string Profile();
 bool Request();
 Snapshot Get();
 }
+
+namespace diagnostics {
+std::string Status();
+}

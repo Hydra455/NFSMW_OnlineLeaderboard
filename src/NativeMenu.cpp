@@ -52,6 +52,7 @@ std::filesystem::path archivePath;
 std::filesystem::path queuePath;
 std::vector<standings::Page> localPages;
 online::Snapshot shared;
+std::string diagnosticText;
 bool onlineConfigured = false;
 bool preferOnline = false;
 standings::Browser browser;
@@ -184,7 +185,8 @@ void RenderPage(void* screen)
     const std::string title = std::string(view) + " | " + ReadableHeading(page);
     SetHeaderFont(Call<void*>(0x5251E0, package, RankingsTitle), package);
     SetText(package, RankingsTitle, title.c_str());
-    ShowPersonal(package, page.personal);
+    diagnosticText = diagnostics::Status();
+    ShowPersonal(package, page.personal.empty() ? diagnosticText : page.personal);
 
     for (size_t index = 0; index < standings::RowsPerPage; ++index) {
         const auto row = index < page.rows.size() ? &page.rows[index] : nullptr;
@@ -272,7 +274,8 @@ void __fastcall OnRankings(void* screen, void*, unsigned message, void*, unsigne
             return;
 
         const auto fresh = onlineConfigured ? online::Get() : online::Snapshot{};
-        const bool changed = fresh.pages != shared.pages || fresh.pending != shared.pending;
+        const bool changed = fresh.pages != shared.pages || fresh.pending != shared.pending
+            || diagnostics::Status() != diagnosticText;
         shared = fresh;
         const bool confirm = ConfirmRequested(message);
         if (message == SwitchView && onlineConfigured) {

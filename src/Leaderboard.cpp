@@ -13,6 +13,7 @@
 #include "StartupLog.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -52,6 +53,23 @@ std::uint64_t snapshotGeneration = 0;
 online::Snapshot snapshot;
 bool snapshotRequested = false;
 bool speedtrapSaved = false;
+std::atomic<bool> captureHookInstalled{false};
+std::atomic<bool> speedtrapCaptureReady{false};
+std::mutex diagnosticLock;
+std::string captureStatus = "Capture starting";
+std::string uploadStatus = "No new upload";
+
+void SetCaptureStatus(const char* text)
+{
+    const std::lock_guard lock(diagnosticLock);
+    captureStatus = text;
+}
+
+void SetUploadStatus(const char* text)
+{
+    const std::lock_guard lock(diagnosticLock);
+    uploadStatus = text;
+}
 
 struct Result {
     unsigned eventHash;
@@ -127,17 +145,26 @@ void ReadCar(void* simable, char* name)
     }
 }
 
-bool ReadResult(void* racer, void* simable, Result* result)
+bool ReadResult(void* racer, void* simable, Result* result, const char** rejection = nullptr)
 {
+    if (rejection)
+        *rejection = nullptr;
     __try {
-        if (!simable || !Virtual<bool>(simable, 0x24) || Read<unsigned char>(racer, 0x1C)
-            || Read<unsigned char>(racer, 0x1D) || Read<unsigned char>(racer, 0x1E))
+        if (!simable || !Virtual<bool>(simable, 0x24))
             return false;
 
         void* player = Virtual<void*>(simable, 0x20);
         if (!player || Virtual<int>(player, 0x1C) != 0)
             return false;
 
+        if (rejection)
+            *rejection = "Skipped: failed or eliminated run";
+        if (Read<unsigned char>(racer, 0x1C) || Read<unsigned char>(racer, 0x1D)
+            || Read<unsigned char>(racer, 0x1E))
+            return false;
+
+        if (rejection)
+            *rejection = "Capture: race state unavailable";
         void* status = Global<void*>(RaceStatus);
         if (!status || Read<int>(status, 0x1964) == 1)
             return false;
@@ -146,19 +173,27 @@ bool ReadResult(void* racer, void* simable, Result* result)
         if (!event || !database)
             return false;
 
+        if (rejection)
+            *rejection = "Capture: profile unavailable";
         void* profile = Read<void*>(database, 0x10);
         if (!profile || !Read<unsigned char>(profile, 0x20)
             || !CopyText(result->profile, sizeof(result->profile),
                          static_cast<const char*>(profile), 32))
             return false;
 
+        if (rejection)
+            *rejection = "Capture: invalid finish time";
         const auto seconds = Read<float>(racer, 0x150);
         if (!(seconds >= 1.0f && seconds <= 21600.0f))
             return false;
 
+        if (rejection)
+            *rejection = "Capture: unsupported race type";
         result->raceType = Method<int>(0x5FAA20, event);
         if (result->raceType < 0 || result->raceType >= static_cast<int>(std::size(races::Modes)))
             return false;
+        if (rejection)
+            *rejection = "Skipped: Tollbooth timeout";
         if (result->raceType == TollboothMode && !(Method<float>(RaceTimeRemaining, status) > 0.0f))
             return false;
 
@@ -168,11 +203,15 @@ bool ReadResult(void* racer, void* simable, Result* result)
                         && Read<unsigned char>(event, 0x1C) != 0;
         result->timeMs = static_cast<int>(static_cast<double>(seconds) * 1000.0 + 0.5);
         if (result->raceType == 5) {
+            if (rejection)
+                *rejection = "Capture: invalid Speedtrap score";
             const auto speed = Read<float>(racer, 0x120);
             if (!(speed >= 0.0f && speed <= 1000000.0f))
                 return false;
             result->speedMilliKmh = static_cast<int>(static_cast<double>(speed) * 1000.0 + 0.5);
         }
+        if (rejection)
+            *rejection = "Capture: event data unavailable";
         if (!result->eventHash || result->laps < 1 || result->laps > 99
             || !CopyText(result->eventId, sizeof(result->eventId),
                          Method<const char*>(0x5FBA70, event), 48))
@@ -186,9 +225,13 @@ bool ReadResult(void* racer, void* simable, Result* result)
                 result->eventName[0] = 0;
         }
         ReadCar(simable, result->car);
+        if (rejection)
+            *rejection = nullptr;
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (rejection && *rejection)
+            *rejection = "Capture: could not read game memory";
         OutputDebugStringA("MWLeaderboard: could not read race result.\n");
         return false;
     }
@@ -215,11 +258,15 @@ std::string JsonString(const char* input)
 bool SaveResult(const Result& result)
 {
     GUID guid{};
-    if (FAILED(CoCreateGuid(&guid)))
+    if (FAILED(CoCreateGuid(&guid))) {
+        SetCaptureStatus("Capture: could not create result ID");
         return false;
+    }
     wchar_t id[39]{};
-    if (!StringFromGUID2(guid, id, 39))
+    if (!StringFromGUID2(guid, id, 39)) {
+        SetCaptureStatus("Capture: could not format result ID");
         return false;
+    }
 
     const std::wstring fileId(id + 1, 36);
     const std::string jsonId(fileId.begin(), fileId.end());
@@ -243,12 +290,14 @@ bool SaveResult(const Result& result)
     file << "}\n";
     file.close();
     if (file && MoveFileExW(pending.c_str(), ready.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        SetCaptureStatus("Result saved locally");
         OutputDebugStringA("MWLeaderboard: race result saved.\n");
         if (uploadSignal)
             SetEvent(uploadSignal);
         return true;
     }
     DeleteFileW(pending.c_str());
+    SetCaptureStatus("Capture: cannot write result file");
     OutputDebugStringA("MWLeaderboard: could not save race result.\n");
     return false;
 }
@@ -257,19 +306,30 @@ void __fastcall OnFinish(void* racer, void* simable)
 {
     const bool wasFinished = Read<unsigned char>(racer, 0x21) != 0;
     Method<void>(FinishRace, racer);
-    if (wasFinished)
+    if (wasFinished) {
+        Result previous{};
+        if (ReadResult(racer, simable, &previous))
+            SetCaptureStatus("Finish skipped: racer already finalized");
         return;
+    }
 
     Result result{};
-    if (!ReadResult(racer, simable, &result))
+    const char* rejection{};
+    if (!ReadResult(racer, simable, &result, &rejection)) {
+        if (rejection)
+            SetCaptureStatus(rejection);
         return;
+    }
     if (result.raceType == 5) {
+        SetCaptureStatus(speedtrapCaptureReady ? "Speedtrap: waiting for final score"
+                                              : "Speedtrap capture unavailable: hook conflict");
         startup::Log("Speedtrap finish detected. Waiting for finalized race statistics.");
         return;
     }
     try {
         SaveResult(result);
     } catch (...) {
+        SetCaptureStatus("Capture: result queue error");
         OutputDebugStringA("MWLeaderboard: result queue error.\n");
     }
 }
@@ -314,8 +374,11 @@ bool ReadFinishedSpeedtrap(void* status, Result* result)
             const auto entry = lookup(first, first + size * 8, handle);
             if (!entry)
                 continue;
-            if (ReadResult(racer, Read<void*>(entry, 4), result))
+            const char* rejection{};
+            if (ReadResult(racer, Read<void*>(entry, 4), result, &rejection))
                 return true;
+            if (rejection)
+                SetCaptureStatus(rejection);
         }
         return false;
     }
@@ -342,6 +405,7 @@ void __fastcall OnFinalizeRaceStats(void* status, void*)
             startup::Log(message);
         }
     } catch (...) {
+        SetCaptureStatus("Capture: Speedtrap queue error");
         startup::Log("Could not queue the finalized Speedtrap result.");
     }
 }
@@ -373,36 +437,32 @@ bool CheckExecutable()
     return true;
 }
 
+bool CaptureCodeMatches(uintptr_t address, std::string_view expected)
+{
+    if (game_image::MatchesCode(address, expected))
+        return true;
+    char message[96]{};
+    std::snprintf(message, sizeof(message), "Capture blocked: code changed at %08X",
+                  static_cast<unsigned>(address));
+    SetCaptureStatus(message);
+    startup::Log(message);
+    return false;
+}
+
 bool InstallFinishHook()
 {
-    using game_image::MatchesCode;
-    if (!MatchesCode(FinishCall - 6, "\x8B\xCB\x89\x5C\x24\x14\xE8\x58\x7D\xFD\xFF\xC7\x43\x18"sv)
-        || !MatchesCode(FinishRace, "\x83\xEC\x10\x56\x8B\xF1\x8A\x86\x54\x01\x00\x00"sv)
-        || !MatchesCode(StartCall, "\xE8\x7D\xE3\xFF\xFF"sv)
-        || !MatchesCode(StartRace, "\x51\xA1\x00\xE0\x91\x00\x56\x8B\xF1"sv)
-        || !MatchesCode(FinalizeCall1, "\xE8\xB5\xC8\xFF\xFF"sv)
-        || !MatchesCode(FinalizeCall2, "\xE8\x69\x75\xFF\xFF"sv)
-        || !MatchesCode(FinalizeCall3, "\xE8\x80\x02\xFF\xFF"sv)
-        || !MatchesCode(FinalizeRaceStats, "\xA1\x00\xE0\x91\x00\x53\x8B\xD9"sv)
-        || !MatchesCode(0x5D51F0, "\x83\xEC\x08\x8B\x4C\x24\x0C\x56\x8B\x74\x24\x14"sv)
-        || !MatchesCode(RaceTimeRemaining, "\x51\x56\x8B\xF1\x8B\x8E\x68\x19\x00\x00"sv)
-        || !MatchesCode(0x5FAA20, "\x56\x8B\xF1\x8B\x46\x04\x85\xC0\x74\x06\x0F\xBE"sv)
-        || !game_image::Readable(RaceStatus, sizeof(void*))
-        || !game_image::Readable(0x92FEB4, sizeof(void*))
-        || !game_image::Readable(0x92FEBC, sizeof(unsigned))
+    if (!CaptureCodeMatches(FinishCall - 6, "\x8B\xCB\x89\x5C\x24\x14\xE8\x58\x7D\xFD\xFF\xC7\x43\x18"sv)
+        || !CaptureCodeMatches(FinishRace, "\x83\xEC\x10\x56\x8B\xF1\x8A\x86\x54\x01\x00\x00"sv)
+        || !CaptureCodeMatches(RaceTimeRemaining, "\x51\x56\x8B\xF1\x8B\x8E\x68\x19\x00\x00"sv)
+        || !CaptureCodeMatches(0x5FAA20, "\x56\x8B\xF1\x8B\x46\x04\x85\xC0\x74\x06\x0F\xBE"sv))
+        return false;
+    if (!game_image::Readable(RaceStatus, sizeof(void*))
         || !game_image::Readable(FrontendDatabase, sizeof(void*))) {
-        startup::Log("Race capture code or data layout differs from the supported layout.");
+        SetCaptureStatus("Capture blocked: game data unavailable");
         return false;
     }
 
     struct Patch { uintptr_t site, original, replacement; };
-    const Patch patches[] = {
-        {StartCall, StartRace, reinterpret_cast<uintptr_t>(&OnRaceStart)},
-        {FinalizeCall1, FinalizeRaceStats, reinterpret_cast<uintptr_t>(&OnFinalizeRaceStats)},
-        {FinalizeCall2, FinalizeRaceStats, reinterpret_cast<uintptr_t>(&OnFinalizeRaceStats)},
-        {FinalizeCall3, FinalizeRaceStats, reinterpret_cast<uintptr_t>(&OnFinalizeRaceStats)},
-        {FinishCall, FinishRace, reinterpret_cast<uintptr_t>(&FinishBridge)}
-    };
     const auto apply = [](const Patch& patch, bool restore) {
         auto site = reinterpret_cast<unsigned char*>(patch.site);
         DWORD protection{};
@@ -419,14 +479,42 @@ bool InstallFinishHook()
         VirtualProtect(site, 5, protection, &ignored);
         return changed;
     };
+    const Patch finish{FinishCall, FinishRace, reinterpret_cast<uintptr_t>(&FinishBridge)};
+    if (!apply(finish, false)) {
+        SetCaptureStatus("Capture blocked: cannot install finish hook");
+        return false;
+    }
+    captureHookInstalled = true;
+
+    if (!CaptureCodeMatches(StartCall, "\xE8\x7D\xE3\xFF\xFF"sv)
+        || !CaptureCodeMatches(StartRace, "\x51\xA1\x00\xE0\x91\x00\x56\x8B\xF1"sv)
+        || !CaptureCodeMatches(FinalizeCall1, "\xE8\xB5\xC8\xFF\xFF"sv)
+        || !CaptureCodeMatches(FinalizeCall2, "\xE8\x69\x75\xFF\xFF"sv)
+        || !CaptureCodeMatches(FinalizeCall3, "\xE8\x80\x02\xFF\xFF"sv)
+        || !CaptureCodeMatches(FinalizeRaceStats, "\xA1\x00\xE0\x91\x00\x53\x8B\xD9"sv)
+        || !CaptureCodeMatches(0x5D51F0, "\x83\xEC\x08\x8B\x4C\x24\x0C\x56\x8B\x74\x24\x14"sv)
+        || !game_image::Readable(0x92FEB4, sizeof(void*))
+        || !game_image::Readable(0x92FEBC, sizeof(unsigned))) {
+        SetCaptureStatus("Timed capture ready; Speedtrap hook conflict");
+        return true;
+    }
+    const Patch patches[] = {
+        {StartCall, StartRace, reinterpret_cast<uintptr_t>(&OnRaceStart)},
+        {FinalizeCall1, FinalizeRaceStats, reinterpret_cast<uintptr_t>(&OnFinalizeRaceStats)},
+        {FinalizeCall2, FinalizeRaceStats, reinterpret_cast<uintptr_t>(&OnFinalizeRaceStats)},
+        {FinalizeCall3, FinalizeRaceStats, reinterpret_cast<uintptr_t>(&OnFinalizeRaceStats)}
+    };
     size_t installed = 0;
     for (; installed < std::size(patches); ++installed) {
         if (!apply(patches[installed], false)) {
             while (installed)
                 apply(patches[--installed], true);
-            return false;
+            SetCaptureStatus("Timed capture ready; Speedtrap hook failed");
+            return true;
         }
     }
+    speedtrapCaptureReady = true;
+    SetCaptureStatus("Capture ready");
     startup::Log("Race capture installed, including finalized Speedtrap scores.");
     return true;
 }
@@ -609,14 +697,18 @@ std::wstring CreatePlayerToken()
 void UploadPending()
 {
     const auto url = Endpoint(L"SubmitUrl", L"/api/runs");
-    if (url.empty())
+    if (url.empty()) {
+        SetUploadStatus("Online disabled");
         return;
+    }
 
     auto credential = ReadSetting(L"PlayerToken");
     const bool autoRegister = credential.empty()
         && (server_config::BaseUrl[0] || ReadSetting(L"AutoRegister") == L"1");
-    if (!autoRegister && !ValidToken(credential))
+    if (!autoRegister && !ValidToken(credential)) {
+        SetUploadStatus("Invalid INI PlayerToken");
         return;
+    }
 
     bool uploaded = false;
     for (const auto& entry : fs::directory_iterator(queuePath)) {
@@ -639,11 +731,13 @@ void UploadPending()
         if (credential.empty())
             credential = CreatePlayerToken();
         if (credential.empty()) {
+            SetUploadStatus("Player identity file unreadable");
             OutputDebugStringA("MWLeaderboard: could not save the player token.\n");
             break;
         }
         const DWORD status = RequestHttp(url, credential, body, nullptr, autoRegister);
         if (status == 200 || status == 201) {
+            SetUploadStatus("Upload accepted");
             uploaded = true;
             const auto destination = archivePath / entry.path().filename();
             if (!MoveFileExW(entry.path().c_str(), destination.c_str(),
@@ -651,6 +745,12 @@ void UploadPending()
                 OutputDebugStringA("MWLeaderboard: uploaded result could not be moved to history.\n");
             continue;
         }
+        char failure[80]{};
+        if (status)
+            std::snprintf(failure, sizeof(failure), "Upload HTTP %lu", status);
+        else
+            std::snprintf(failure, sizeof(failure), "Upload connection failed");
+        SetUploadStatus(failure);
         if (status == 400 || status == 409 || status == 413 || status == 422) {
             auto rejected = entry.path();
             rejected.replace_extension(L".rejected");
@@ -706,8 +806,10 @@ DWORD WINAPI Run(void* module)
         queuePath = parent / L"MWLeaderboardQueue";
         archivePath = parent / L"MWLeaderboardHistory";
         uploadSignal = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!uploadSignal)
+        if (!uploadSignal) {
+            SetUploadStatus("Upload worker unavailable");
             startup::Log("Could not start online standings or uploads.");
+        }
 
         const bool menuInstalled = native_menu::Install(archivePath, queuePath);
         if (menuInstalled)
@@ -717,8 +819,10 @@ DWORD WINAPI Run(void* module)
         std::error_code historyError;
         fs::create_directories(queuePath, queueError);
         fs::create_directories(archivePath, historyError);
-        if (queueError)
+        if (queueError) {
+            SetCaptureStatus("Capture blocked: scripts folder not writable");
             startup::Log("Could not create the results queue. Check write access for the scripts folder.");
+        }
         if (historyError)
             startup::Log("Could not create the results history. Check write access for the scripts folder.");
 
@@ -733,6 +837,7 @@ DWORD WINAPI Run(void* module)
                     UploadPending();
                 DownloadStandings();
             } catch (...) {
+                SetUploadStatus("Upload queue unreadable");
                 OutputDebugStringA("MWLeaderboard: could not read upload queue.\n");
             }
         } while (WaitForSingleObject(uploadSignal, 10000) != WAIT_FAILED);
@@ -796,6 +901,19 @@ void Log(const char* message) noexcept
         return;
     OutputDebugStringA(line);
 
+}
+}
+
+namespace diagnostics {
+std::string Status()
+{
+    if (captureHookInstalled && (!game_image::Readable(FinishCall, 5)
+        || Read<unsigned char>(reinterpret_cast<const void*>(FinishCall)) != 0xE8
+        || Read<LONG>(reinterpret_cast<const void*>(FinishCall + 1))
+            != static_cast<LONG>(reinterpret_cast<uintptr_t>(&FinishBridge) - (FinishCall + 5))))
+        SetCaptureStatus("Capture hook replaced by another mod");
+    const std::lock_guard lock(diagnosticLock);
+    return captureStatus + " | " + uploadStatus;
 }
 }
 

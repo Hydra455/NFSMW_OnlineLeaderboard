@@ -1,0 +1,14 @@
+{
+  "name": "mw-leaderboard",
+  "main": "worker.mjs",
+  "compatibility_date": "2025-10-01",
+  "workers_dev": true,
+  "vars": { "OPEN_REGISTRATION": "1" },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mw-leaderboard",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}
